@@ -1,0 +1,94 @@
+name: Sync Upstream Nightly
+
+# Merges dolphin-emu/dolphin master into this fork's master once a day,
+# keeping the custom-storage feature rebased on top of upstream nightlies.
+# If the merge conflicts, the job aborts the merge, opens (or updates) an
+# issue, and fails so nothing half-merged is ever pushed.
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-nightly
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream master
+        run: |
+          git remote add upstream https://github.com/dolphin-emu/dolphin.git
+          git fetch upstream master --quiet
+
+      - name: Check whether already up to date
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Already contains upstream master tip $(git rev-parse --short upstream/master)"
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream master
+        if: steps.check.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          set +e
+          git merge upstream/master --no-edit \
+            -m "Merge upstream master $(git rev-parse --short upstream/master)"
+          status=$?
+          set -e
+          if [ $status -ne 0 ]; then
+            git merge --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push merged master
+        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
+        run: git push origin master
+
+      - name: Open issue on merge conflict
+        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Nightly upstream sync has merge conflicts"
+          UPSTREAM=$(git rev-parse --short upstream/master)
+          BODY="Merging upstream master (\`$UPSTREAM\`) into this fork's master hit conflicts and needs a manual merge.
+
+          To resolve locally:
+          \`\`\`
+          git fetch upstream master
+          git merge upstream/master   # resolve conflicts
+          git push origin master
+          \`\`\`
+          The nightly sync will resume automatically once master contains the upstream tip."
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Still conflicting as of upstream \`$UPSTREAM\`."
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+          exit 1
