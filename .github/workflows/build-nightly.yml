@@ -1,0 +1,146 @@
+name: Build Nightly Release
+
+# Builds a signed release APK from master and publishes it as a GitHub
+# release tagged nightly-<date>-<sha>. Dispatched by the nightly upstream
+# sync after a successful merge (pushes made with GITHUB_TOKEN don't fire
+# on:push, so the sync workflow calls this explicitly); also fires on
+# manual pushes to master and can be run by hand from the Actions tab.
+#
+# Signing: uses the RELEASE_KEYSTORE_* repo secrets when configured, so
+# every nightly carries the same signature and installs over the previous
+# one. If the secrets are missing it falls back to a throwaway key
+# generated in the runner — the APK still installs, but each nightly then
+# has a new signature and Android will demand an uninstall first.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nightly
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK version pinned by the project
+        run: |
+          NDK_VERSION=$(grep -oE 'ndkVersion = "[0-9.]+"' Source/Android/app/build.gradle.kts | grep -oE '[0-9.]+')
+          echo "Project pins NDK $NDK_VERSION"
+          sdkmanager "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache CMake build output
+        uses: actions/cache@v4
+        with:
+          path: Source/Android/.cxx
+          key: cxx-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'Source/Core/**/*.cpp', 'Source/Core/**/*.h') }}
+          restore-keys: cxx-${{ runner.os }}-
+
+      - name: Prepare signing keystore
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            echo "storepass=$KEYSTORE_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "keyalias=$KEY_ALIAS" >> "$GITHUB_OUTPUT"
+            echo "keypass=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"
+            echo "throwaway=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::RELEASE_KEYSTORE_* secrets not set — signing with a throwaway key. Each nightly will have a different signature until the secrets are configured."
+            PASS=$(openssl rand -base64 18)
+            openssl req -x509 -newkey rsa:2048 -keyout "$RUNNER_TEMP/key.pem" \
+              -out "$RUNNER_TEMP/cert.pem" -days 10950 -nodes -subj "/CN=Dolphin CS/O=sayenah"
+            openssl pkcs12 -export -inkey "$RUNNER_TEMP/key.pem" -in "$RUNNER_TEMP/cert.pem" \
+              -name dolphincs -out "$RUNNER_TEMP/release.p12" -passout pass:"$PASS"
+            rm "$RUNNER_TEMP/key.pem" "$RUNNER_TEMP/cert.pem"
+            echo "storepass=$PASS" >> "$GITHUB_OUTPUT"
+            echo "keyalias=dolphincs" >> "$GITHUB_OUTPUT"
+            echo "keypass=$PASS" >> "$GITHUB_OUTPUT"
+            echo "throwaway=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release APK
+        working-directory: Source/Android
+        run: |
+          ./gradlew assembleRelease --no-daemon \
+            -Pkeystore="$RUNNER_TEMP/release.p12" \
+            -Pstorepass='${{ steps.keystore.outputs.storepass }}' \
+            -Pkeyalias='${{ steps.keystore.outputs.keyalias }}' \
+            -Pkeypass='${{ steps.keystore.outputs.keypass }}'
+
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.p12"
+
+      - name: Name release
+        id: name
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          SHA=$(git rev-parse --short HEAD)
+          DOLPHIN_VERSION=$(git describe --tags --long --abbrev=8 2>/dev/null || echo "$SHA")
+          TAG="nightly-$(date -u +%Y%m%d)-$SHA"
+          APK="Dolphin-CS-$TAG.apk"
+          mv Source/Android/app/build/outputs/apk/release/app-release.apk "$APK"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "version=$DOLPHIN_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.name.outputs.tag }}
+          name: "Dolphin CS nightly ${{ steps.name.outputs.date }}"
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: ${{ steps.name.outputs.apk }}
+          body: |
+            Automated nightly build of upstream [dolphin-emu/dolphin](https://github.com/dolphin-emu/dolphin) master
+            (`${{ steps.name.outputs.version }}`) with the custom user data storage location feature on top
+            (Scoped Storage / Internal Storage / SD Card / Custom Location folder picker).
+
+            Sideload the APK (installs as "Dolphin CS", package `com.sayenah.dolphinemu`, alongside official Dolphin).
+            ${{ steps.keystore.outputs.throwaway == 'true' && '⚠️ Signed with a throwaway key — uninstall the previous nightly before installing this one.' || 'Signed with the release key — installs directly over the previous nightly.' }}
+
+            This is an unofficial community build, not affiliated with the Dolphin team.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prune old nightlies (keep 14)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | grep '^nightly-' | tail -n +15 | while read -r tag; do
+              echo "Deleting old nightly $tag"
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+            done

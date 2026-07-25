@@ -13,6 +13,7 @@ on:
 permissions:
   contents: write
   issues: write
+  actions: write
 
 concurrency:
   group: sync-upstream-nightly
@@ -68,6 +69,14 @@ jobs:
       - name: Push merged master
         if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
         run: git push origin master
+
+      # Pushes made with GITHUB_TOKEN don't trigger on:push workflows, so
+      # kick off the nightly build explicitly.
+      - name: Dispatch nightly build
+        if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-nightly.yml -R "$GITHUB_REPOSITORY"
 
       - name: Open issue on merge conflict
         if: steps.check.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'true'
