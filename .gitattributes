@@ -1,1 +1,2 @@
 *.sln text eol=crlf
+Readme.md merge=ours
